@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "id": "ferm.agent-desktop",
+  "id": "io.github.jonatanferm.agent-desktop",
   "name": "Agent Desktop",
   "version": "0.3.0",
   "author": "Jonatan Ferm",

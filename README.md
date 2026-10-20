@@ -2,7 +2,7 @@
 
 **A private, headless Linux desktop for AI agents, so they can use GUI apps without touching your screen, mouse, or keyboard.**
 
-![Chromium and a GTK dialog running inside the agent desktop, captured by the agent](docs/screenshot.png)
+![Chromium and a GTK dialog running inside the agent desktop, captured by the agent](preview.png)
 
 Computer-use agents normally drive your real desktop: they steal focus, move your pointer, and type into whatever window happens to be in front. Agent Desktop gives the agent a desktop of its own instead. It starts a headless Sway compositor with Xwayland, a private D-Bus session, and a VNC bridge on a Unix socket. The agent launches apps there and sees and controls them through a small CLI or an MCP server, while you keep working on your own desktop.
 
@@ -38,6 +38,19 @@ Start a new agent session and ask it to do something in a GUI app. On Omarchy yo
 ```sh
 omarchy plugin add https://github.com/jonatanferm/agent-desktop --enable
 ```
+
+## Uninstall
+
+Stop the desktop, then remove whichever pieces you added:
+
+```sh
+bin/agent-desktop stop                                    # closes apps, ends all session processes
+claude mcp remove agent-desktop                           # and/or: codex mcp remove agent-desktop
+omarchy plugin remove io.github.jonatanferm.agent-desktop  # if installed as an Omarchy plugin
+rm -rf ~/.local/share/agent-desktop                       # the agent's app profiles (browser data etc.)
+```
+
+Agent Desktop itself writes only to `~/.local/share/agent-desktop/`, to `$XDG_RUNTIME_DIR/agent-desktop/` (cleared on stop), and to screenshot paths you give it. It never modifies your own configuration.
 
 To watch what the agent is doing, or to step in (for example at a CAPTCHA), bridge the VNC socket to localhost and connect a viewer:
 

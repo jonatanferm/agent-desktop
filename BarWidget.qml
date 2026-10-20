@@ -4,7 +4,7 @@ import qs.Ui
 
 BarWidget {
   id: root
-  moduleName: "ferm.agent-desktop"
+  moduleName: "io.github.jonatanferm.agent-desktop"
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
 
@@ -16,7 +16,7 @@ BarWidget {
     tooltipText: "Toggle the separate agent desktop"
     onPressed: function(b) {
       if (b === Qt.LeftButton && root.bar)
-        root.bar.run("~/.config/omarchy/plugins/ferm.agent-desktop/bin/agent-desktop toggle")
+        root.bar.run("~/.config/omarchy/plugins/io.github.jonatanferm.agent-desktop/bin/agent-desktop toggle")
     }
   }
 }
