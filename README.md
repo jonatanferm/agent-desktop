@@ -172,4 +172,4 @@ Beyond Sway, WayVNC, and wl-clipboard, the project needs only the Python standar
 
 ## License
 
-[MIT](LICENSE)
+[BSD Zero Clause (0BSD)](LICENSE): use it for anything, no attribution required.
