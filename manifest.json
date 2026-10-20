@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "id": "ferm.agent-desktop",
+  "name": "Agent Desktop",
+  "version": "0.3.0",
+  "author": "ferm",
+  "license": "MIT",
+  "description": "A separate headless Wayland desktop for GUI agents, with local screenshot and input controls.",
+  "kinds": ["bar-widget"],
+  "activation": "on-demand",
+  "entryPoints": { "barWidget": "BarWidget.qml" },
+  "barWidget": {
+    "displayName": "Agent Desktop",
+    "description": "Start or stop the agent's separate GUI desktop.",
+    "category": "AI",
+    "allowMultiple": false
+  }
+}

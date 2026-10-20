@@ -1,0 +1,980 @@
+#!/usr/bin/env python3
+"""Control a private headless Sway + WayVNC desktop."""
+
+import argparse
+import ctypes
+import fcntl
+import json
+import os
+import secrets
+import shlex
+import shutil
+import signal
+import socket
+import struct
+import subprocess
+import sys
+import time
+import zlib
+from contextlib import contextmanager
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+RUNTIME = Path(os.environ.get("AGENT_DESKTOP_RUNTIME", Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")) / "agent-desktop"))
+DATA = Path(os.environ.get("AGENT_DESKTOP_DATA", Path.home() / ".local/share/agent-desktop"))
+# Locally extracted packages, used only when sway or wayvnc is not installed system-wide.
+PACKAGES = Path(os.environ.get("AGENT_DESKTOP_PACKAGES", Path.home() / ".local/share/agent-desktop/runtime-packages/usr"))
+STATE = RUNTIME / "state.json"
+VNC = RUNTIME / "vnc.sock"
+CONTROL = RUNTIME / "control.sock"
+DISPLAY_RECORD = RUNTIME / "display.json"
+LOCK = RUNTIME / "lock"
+APP_LOG = RUNTIME / "apps.log"
+MARKER = "AGENT_DESKTOP_SESSION"
+KEYS = {"enter": 0xFF0D, "return": 0xFF0D, "tab": 0xFF09, "escape": 0xFF1B, "esc": 0xFF1B,
+        "backspace": 0xFF08, "delete": 0xFFFF, "del": 0xFFFF, "insert": 0xFF63, "left": 0xFF51,
+        "up": 0xFF52, "right": 0xFF53, "down": 0xFF54, "space": 0x20, "home": 0xFF50,
+        "end": 0xFF57, "pageup": 0xFF55, "page_up": 0xFF55, "pagedown": 0xFF56, "page_down": 0xFF56,
+        "menu": 0xFF67, "plus": 0x2B, "minus": 0x2D}
+MODIFIERS = {"ctrl": 0xFFE3, "control": 0xFFE3, "alt": 0xFFE9, "shift": 0xFFE1, "super": 0xFFEB,
+             "meta": 0xFFEB, "cmd": 0xFFEB, "win": 0xFFEB, "altgr": 0xFE03}
+BUTTONS = {"left": 1, "middle": 2, "right": 4}
+UNSHIFTED = dict(zip("abcdefghijklmnopqrstuvwxyz`1234567890-=[]\\;',./", 'ABCDEFGHIJKLMNOPQRSTUVWXYZ~!@#$%^&*()_+{}|:"<>?'))
+SHIFTED = set(UNSHIFTED.values())
+TERMINALS = {"foot", "footclient", "kitty", "alacritty", "ghostty", "wezterm", "xterm", "urxvt", "konsole",
+             "tilix", "terminator", "st", "rio", "contour"}
+SCROLL = {"up": 8, "down": 16, "left": 32, "right": 64}
+MAX_BATCH = 40
+MAX_BATCH_SECONDS = 30
+CHILDREN = []
+
+
+def keysym(name):
+    if not isinstance(name, str) or not name:
+        raise RuntimeError("key name must be nonempty text")
+    if len(name) == 1:
+        code = ord(name)
+        return code if 0x20 <= code <= 0x7E or 0xA0 <= code <= 0xFF else 0x01000000 | code
+    if name.lower() in KEYS:
+        return KEYS[name.lower()]
+    if name.lower() in MODIFIERS:
+        return MODIFIERS[name.lower()]
+    lib = ctypes.CDLL("libxkbcommon.so.0")
+    lib.xkb_keysym_from_name.argtypes = (ctypes.c_char_p, ctypes.c_int)
+    lib.xkb_keysym_from_name.restype = ctypes.c_uint32
+    # Exact case first so "A" and "a" stay distinct; case-insensitive only as a fallback for names like "f5".
+    code = lib.xkb_keysym_from_name(name.encode(), 0) or lib.xkb_keysym_from_name(name.encode(), 1)
+    if code:
+        return code
+    raise RuntimeError(f"unknown key: {name}")
+
+
+def parse_key(key, modifiers=()):
+    """Split xdotool-style combos such as "ctrl+shift+t" into a key and modifiers."""
+    if not isinstance(key, str) or not key:
+        raise RuntimeError("key must be nonempty text")
+    if not isinstance(modifiers, (list, tuple)) or any(not isinstance(name, str) for name in modifiers):
+        raise RuntimeError("modifiers must be a list of names")
+    mods = [name.lower() for name in modifiers]
+    if len(key) > 1 and "+" in key:
+        if key.endswith("++"):
+            mods += key[:-2].lower().split("+")
+            key = "+"
+        else:
+            *extra, key = key.split("+")
+            mods += [name.lower() for name in extra]
+    unknown = [name for name in mods if name not in MODIFIERS]
+    if unknown:
+        raise RuntimeError(f"unknown modifier: {', '.join(unknown)}; use {', '.join(sorted(MODIFIERS))}")
+    return physical(keysym(key), [MODIFIERS[name] for name in dict.fromkeys(mods)])
+
+
+def physical(code, modifiers):
+    """Describe a key the way a physical US-keyboard VNC client would, which is what WayVNC expects.
+
+    WayVNC picks the key level from the keysym: shift+"v" arrives as plain "v" and "$" without Shift is ignored
+    by some apps. So shift+v becomes Shift+"V", shift+4 becomes Shift+"$", and "$" alone gains Shift.
+    """
+    char = chr(code) if code < 0x80 else ""
+    shift = MODIFIERS["shift"]
+    if char and shift in modifiers and char in UNSHIFTED:
+        code = ord(UNSHIFTED[char])
+    elif char in SHIFTED and shift not in modifiers:
+        modifiers = [*modifiers, shift]
+    return code, modifiers
+
+
+def resolution():
+    value = os.environ.get("AGENT_DESKTOP_RESOLUTION", "1280x800")
+    try:
+        width, height = (int(part) for part in value.lower().split("x"))
+    except ValueError:
+        raise RuntimeError(f"AGENT_DESKTOP_RESOLUTION must look like 1280x800, not {value!r}") from None
+    if not (320 <= width <= 7680 and 240 <= height <= 4320):
+        raise RuntimeError("AGENT_DESKTOP_RESOLUTION must be between 320x240 and 7680x4320")
+    return width, height
+
+
+def binary(name):
+    override = os.environ.get(f"AGENT_DESKTOP_{name.upper()}")
+    if override:
+        return override
+    found = shutil.which(name)
+    if found:
+        return found
+    fallback = PACKAGES / "bin" / name
+    return str(fallback) if fallback.exists() else None
+
+
+def with_fallback_libs(env, program):
+    if program.startswith(str(PACKAGES)):
+        env["LD_LIBRARY_PATH"] = ":".join(filter(None, (str(PACKAGES / "lib"), env.get("LD_LIBRARY_PATH"))))
+    return env
+
+
+def private_runtime():
+    RUNTIME.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if RUNTIME.is_symlink() or RUNTIME.stat().st_uid != os.getuid() or RUNTIME.stat().st_mode & 0o077:
+        raise RuntimeError(f"runtime directory must be owned by you and mode 0700: {RUNTIME}")
+
+
+@contextmanager
+def locked():
+    private_runtime()
+    with open(LOCK, "a") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        yield
+
+
+def write_json(path, value):
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(value) + "\n")
+    temporary.chmod(0o600)
+    temporary.replace(path)
+
+
+def birth(pid):
+    try:
+        return Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[1].split()[19]
+    except (OSError, TypeError, IndexError):
+        return None
+
+
+def live(pid, expected_birth=None):
+    current = birth(pid)
+    return current is not None and (expected_birth is None or current == expected_birth)
+
+
+def raw_state():
+    try:
+        return json.loads(STATE.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+
+
+def state(required=True):
+    data = raw_state()
+    if data is None:
+        if required:
+            raise RuntimeError("agent desktop is not running; use 'start'")
+        return None
+    if (not data.get("session_birth") or not data.get("wayvnc_birth")
+            or not live(data.get("session_pid"), data.get("session_birth"))
+            or not live(data.get("wayvnc_pid"), data.get("wayvnc_birth")) or not VNC.exists()):
+        if required:
+            raise RuntimeError("agent desktop state is stale; use 'restart'")
+        return None
+    return data
+
+
+def base_env(token):
+    env = os.environ.copy()
+    env.setdefault("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+    for name in ("DISPLAY", "WAYLAND_DISPLAY", "SWAYSOCK", "HYPRLAND_INSTANCE_SIGNATURE", "I3SOCK",
+                 "DBUS_SESSION_BUS_ADDRESS", "QT_QPA_PLATFORM", "GDK_BACKEND", "WAYLAND_SOCKET",
+                 # The host's input method (e.g. fcitx) is not running here; X11 apps drop keys trying to use it.
+                 "INPUT_METHOD", "XMODIFIERS", "GTK_IM_MODULE", "QT_IM_MODULE", "SDL_IM_MODULE", "GLFW_IM_MODULE"):
+        env.pop(name, None)
+    fallback_libs = str(PACKAGES / "lib")
+    paths = [part for part in env.get("LD_LIBRARY_PATH", "").split(":") if part and part != fallback_libs]
+    env["LD_LIBRARY_PATH"] = ":".join(paths)
+    if not paths:
+        env.pop("LD_LIBRARY_PATH")
+    env["XDG_CURRENT_DESKTOP"] = "sway"
+    env["XDG_SESSION_DESKTOP"] = "agent-desktop"
+    env["XDG_SESSION_TYPE"] = "wayland"
+    env["XDG_CONFIG_HOME"] = str(DATA / "config")
+    env["XDG_DATA_HOME"] = str(DATA / "data")
+    env["XDG_CACHE_HOME"] = str(DATA / "cache")
+    env[MARKER] = token
+    return env
+
+
+def desktop_env(data):
+    """Environment for programs inside the private desktop."""
+    env = base_env(data.get("token", ""))
+    env["WAYLAND_DISPLAY"] = data["display"]
+    for key, name in (("sway_sock", "SWAYSOCK"), ("x_display", "DISPLAY"), ("dbus", "DBUS_SESSION_BUS_ADDRESS")):
+        if data.get(key):
+            env[name] = data[key]
+    return env
+
+
+def marked_processes(token):
+    """Processes that inherited this desktop's session marker, including apps that detached from Sway."""
+    needle = f"{MARKER}={token}\0".encode()
+    found = {}
+    for entry in os.scandir("/proc"):
+        if not entry.name.isdigit() or int(entry.name) == os.getpid():
+            continue
+        try:
+            if needle in Path(f"/proc/{entry.name}/environ").read_bytes():
+                found[int(entry.name)] = birth(entry.name)
+        except OSError:
+            continue
+    return found
+
+
+def cleanup(data):
+    targets = {}
+    if data:
+        for key in ("wayvnc", "session"):
+            pid, born = data.get(f"{key}_pid"), data.get(f"{key}_birth")
+            if isinstance(pid, int) and born and live(pid, born):
+                targets[pid] = born
+        if data.get("token"):
+            targets.update(marked_processes(data["token"]))
+        elif targets.get(data.get("session_pid")):
+            os.killpg(data["session_pid"], signal.SIGTERM)  # Desktops started before session markers existed.
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        for pid, born in targets.items():
+            if born and live(pid, born):
+                try:
+                    os.kill(pid, sig)
+                except ProcessLookupError:
+                    pass
+        deadline = time.monotonic() + 3
+        while any(born and live(pid, born) for pid, born in targets.items()) and time.monotonic() < deadline:
+            time.sleep(0.05)
+    for path in (VNC, CONTROL, DISPLAY_RECORD, STATE):
+        path.unlink(missing_ok=True)
+    return len(targets)
+
+
+def start():
+    with locked():
+        if state(required=False):
+            return "agent desktop is already running"
+        cleanup(raw_state())
+        for subdir in ("config", "data", "cache"):
+            (DATA / subdir).mkdir(mode=0o700, parents=True, exist_ok=True)
+        width, height = resolution()
+        sway, wayvnc = binary("sway"), binary("wayvnc")
+        dbus_run_session = shutil.which("dbus-run-session")
+        if not sway or not wayvnc:
+            raise RuntimeError("install sway and wayvnc first: omarchy pkg add sway wayvnc")
+        if not dbus_run_session:
+            raise RuntimeError("dbus-run-session is required for a separate desktop bus")
+        token = secrets.token_hex(12)
+        config = RUNTIME / "sway.conf"
+        record_cmd = shlex.join([sys.executable, str(Path(__file__).resolve()), "_record"])
+        config.write_text(f"output * resolution {width}x{height}\n" + (ROOT / "config/sway.conf").read_text()
+                          + f"\nexec {record_cmd}\n")
+        config.chmod(0o600)
+        env = with_fallback_libs(base_env(token), sway)
+        env["WLR_BACKENDS"] = "headless"
+        env["WLR_LIBINPUT_NO_DEVICES"] = "1"
+        env["WLR_RENDERER"] = "pixman"
+        with open(RUNTIME / "sway.log", "ab", buffering=0) as log:
+            proc = subprocess.Popen([dbus_run_session, "--", sway, "-c", str(config)], env=env,
+                                    stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+                                    start_new_session=True)
+        vnc_proc = None
+        try:
+            deadline = time.monotonic() + 10
+            while not DISPLAY_RECORD.exists():
+                if proc.poll() is not None:
+                    raise RuntimeError(f"sway exited with {proc.returncode}; see {RUNTIME / 'sway.log'}")
+                if time.monotonic() > deadline:
+                    raise RuntimeError(f"sway did not expose its display; see {RUNTIME / 'sway.log'}")
+                time.sleep(0.05)
+            data = {"token": token, **json.loads(DISPLAY_RECORD.read_text())}
+            with open(RUNTIME / "wayvnc.log", "ab", buffering=0) as log:
+                # A fixed US keymap makes the set of directly typeable characters predictable.
+                vnc_proc = subprocess.Popen([wayvnc, "-C", "/dev/null", "-k", "us", "-S", str(CONTROL), f"unix:{VNC}"],
+                                            env=with_fallback_libs(desktop_env(data), wayvnc),
+                                            stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+                                            start_new_session=True)
+            while not VNC.exists():
+                if vnc_proc.poll() is not None:
+                    raise RuntimeError(f"wayvnc exited with {vnc_proc.returncode}; see {RUNTIME / 'wayvnc.log'}")
+                if time.monotonic() > deadline:
+                    raise RuntimeError(f"wayvnc did not open its socket; see {RUNTIME / 'wayvnc.log'}")
+                time.sleep(0.05)
+            write_json(STATE, {**data, "session_pid": proc.pid, "session_birth": birth(proc.pid),
+                               "wayvnc_pid": vnc_proc.pid, "wayvnc_birth": birth(vnc_proc.pid),
+                               "resolution": f"{width}x{height}"})
+            return f"agent desktop running on {data['display']} at {width}x{height}; VNC socket: {VNC}"
+        except BaseException:
+            cleanup({"token": token, "session_pid": proc.pid, "session_birth": birth(proc.pid),
+                     **({"wayvnc_pid": vnc_proc.pid, "wayvnc_birth": birth(vnc_proc.pid)} if vnc_proc else {})})
+            raise
+
+
+def stop():
+    with locked():
+        data = raw_state()
+        if data is None and not VNC.exists():
+            return "agent desktop is stopped"
+        if state(required=False):
+            close_windows()
+        count = cleanup(data)
+        return f"agent desktop stopped ({count} processes ended)"
+
+
+def close_windows(timeout=5):
+    """Ask every window to close and wait for its app to exit, so browsers save state instead of reporting a crash."""
+    try:
+        owners = {}
+        for window in windows():
+            owners[window["pid"]] = birth(window["pid"])
+            sway_command(f"[con_id={window['id']}] kill")
+        deadline = time.monotonic() + timeout
+        while any(live(pid, born) for pid, born in owners.items()) and time.monotonic() < deadline:
+            time.sleep(0.1)
+    except (RuntimeError, OSError):
+        pass  # Signals in cleanup() still end everything.
+
+
+def record():
+    private_runtime()
+    write_json(DISPLAY_RECORD, {"display": os.environ["WAYLAND_DISPLAY"], "sway_sock": os.environ.get("SWAYSOCK", ""),
+                                "x_display": os.environ.get("DISPLAY", ""),
+                                "dbus": os.environ.get("DBUS_SESSION_BUS_ADDRESS", "")})
+
+
+def read_exact(sock, size):
+    data = bytearray()
+    while len(data) < size:
+        chunk = sock.recv(size - len(data))
+        if not chunk:
+            raise RuntimeError("connection closed")
+        data.extend(chunk)
+    return bytes(data)
+
+
+def sway_ipc(kind, payload=""):
+    body = payload.encode()
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+        sock.settimeout(5)
+        sock.connect(state()["sway_sock"])
+        sock.sendall(b"i3-ipc" + struct.pack("=II", len(body), kind) + body)
+        length = struct.unpack("=II", read_exact(sock, 14)[6:])[0]
+        return json.loads(read_exact(sock, length))
+
+
+def sway_command(command):
+    failed = [item.get("error", "failed") for item in sway_ipc(0, command) if not item.get("success")]
+    if failed:
+        raise RuntimeError(f"sway: {'; '.join(failed)}")
+
+
+def windows():
+    found = []
+
+    def walk(node):
+        children = node.get("nodes", []) + node.get("floating_nodes", [])
+        if node.get("type") in ("con", "floating_con") and not children and node.get("pid"):
+            props = node.get("window_properties") or {}
+            found.append({"id": node["id"], "app": node.get("app_id") or props.get("class") or "",
+                          "title": node.get("name") or "", "focused": node.get("focused", False),
+                          "visible": node.get("visible", False), "floating": node["type"] == "floating_con",
+                          "fullscreen": bool(node.get("fullscreen_mode")), "xwayland": node.get("shell") == "xwayland",
+                          "pid": node["pid"], "rect": {key: node["rect"][key] for key in ("x", "y", "width", "height")}})
+        for child in children:
+            walk(child)
+
+    walk(sway_ipc(4))
+    return found
+
+
+def focused_window():
+    return next((window for window in windows() if window["focused"]), None)
+
+
+def window_action(operation, window_id):
+    commands = {"focus": "focus", "close": "kill", "fullscreen": "fullscreen toggle", "float": "floating toggle"}
+    if operation not in commands:
+        raise RuntimeError(f"window operation must be one of {', '.join(commands)}")
+    if type(window_id) is not int or all(window["id"] != window_id for window in windows()):
+        raise RuntimeError(f"no window with id {window_id!r}; list windows first")
+    sway_command(f"[con_id={window_id}] {commands[operation]}")
+
+
+def log_tail(path, size=1500):
+    try:
+        with open(path, "rb") as handle:
+            handle.seek(max(0, handle.seek(0, os.SEEK_END) - size))
+            return handle.read().decode(errors="replace").strip()
+    except OSError:
+        return ""
+
+
+def launch(command, wait_ms=5000, cwd=None):
+    """Start an app inside the desktop and wait for a new window to appear."""
+    data = state()
+    cwd = Path(cwd).expanduser() if cwd else Path.home()
+    if not cwd.is_dir():
+        raise RuntimeError(f"working directory does not exist: {cwd}")
+    if not isinstance(command, list) or not command or any(not isinstance(part, str) or not part for part in command):
+        raise RuntimeError("command must be a nonempty list of strings")
+    if type(wait_ms) is not int or not 0 <= wait_ms <= 30000:
+        raise RuntimeError("wait_ms must be 0 to 30000")
+    CHILDREN[:] = [child for child in CHILDREN if child.poll() is None]
+    before = {window["id"] for window in windows()}
+    with open(APP_LOG, "ab", buffering=0) as log:
+        log.write(f"--- {time.strftime('%F %T')} {shlex.join(command)}\n".encode())
+        try:
+            proc = subprocess.Popen(command, env=desktop_env(data), cwd=cwd, stdin=subprocess.DEVNULL,
+                                    stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+        except OSError as exc:
+            raise RuntimeError(f"cannot start {command[0]}: {exc.strerror}") from None
+    CHILDREN.append(proc)
+    deadline = time.monotonic() + wait_ms / 1000
+    seen, quiet_since = None, None
+    while True:
+        current = windows()
+        new = [window for window in current if window["id"] not in before]
+        if new:
+            # Splash screens and first-run dialogs arrive in sequence; report once the window set stops changing.
+            signature = [(window["id"], window["focused"]) for window in current]
+            if signature != seen:
+                seen, quiet_since = signature, time.monotonic()
+            elif time.monotonic() - quiet_since >= 0.8 or time.monotonic() >= deadline:
+                focused = next((window for window in new if window["focused"]), new[-1])
+                return {"pid": proc.pid, "window": focused, "new_windows": new}
+            time.sleep(0.1)
+            continue
+        code = proc.poll()
+        if code:
+            raise RuntimeError(f"{command[0]} exited with {code} before opening a window:\n{log_tail(APP_LOG)}")
+        if time.monotonic() >= deadline:
+            return {"pid": proc.pid, "window": None}
+        time.sleep(0.1)
+
+
+def encode_png(width, height, rgb, scale=1):
+    stride = width * 3
+    rows = []
+    for y in range(height):
+        row = rgb[y * stride:(y + 1) * stride]
+        if scale > 1:
+            wide = bytearray(len(row) * scale)
+            for copy in range(scale):
+                for channel in range(3):
+                    wide[copy * 3 + channel::3 * scale] = row[channel::3]
+            row = wide
+        rows.extend([row] * scale)
+
+    def chunk(kind, data):
+        payload = kind + data
+        return struct.pack(">I", len(data)) + payload + struct.pack(">I", zlib.crc32(payload) & 0xFFFFFFFF)
+
+    raw = b"".join(b"\0" + bytes(row) for row in rows)
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", width * scale, height * scale, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(raw, 6)) + chunk(b"IEND", b""))
+
+
+class Rfb:
+    """One VNC client connection. Input state held by this connection is tracked so it can be released."""
+
+    def __init__(self):
+        data = state()
+        self.token = data.get("token")
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.settimeout(10)
+        self.sock.connect(str(VNC))
+        version = read_exact(self.sock, 12)
+        if not version.startswith(b"RFB 003."):
+            raise RuntimeError(f"unsupported VNC version: {version!r}")
+        self.sock.sendall(b"RFB 003.008\n")
+        count = read_exact(self.sock, 1)[0]
+        security = read_exact(self.sock, count)
+        if 1 not in security:
+            raise RuntimeError("private VNC socket did not offer no-auth security")
+        self.sock.sendall(b"\x01")
+        if read_exact(self.sock, 4) != b"\0\0\0\0":
+            raise RuntimeError("VNC authentication failed")
+        self.sock.sendall(b"\x01")
+        init = read_exact(self.sock, 24)
+        self.width, self.height = struct.unpack(">HH", init[:4])
+        read_exact(self.sock, struct.unpack(">I", init[20:24])[0])
+        # 32-bit little-endian RGBX, so each pixel's bytes are already R, G, B, padding.
+        self.sock.sendall(b"\0\0\0\0" + struct.pack(">BBBBHHHBBBxxx", 32, 24, 0, 1, 255, 255, 255, 0, 8, 16))
+        self.sock.sendall(struct.pack(">BBHi", 2, 0, 1, 0))
+        self.frame = bytearray(self.width * self.height * 4)
+        self.held_keys = []
+        self.buttons = 0
+        self.position = None
+        self.input_ready = time.monotonic() + 0.25  # WayVNC attaches the virtual seat shortly after connecting.
+        # WayVNC captures only while a client is connected and first answers with its last frame, which may be
+        # from before earlier input; fresh frames follow within a few frame periods.
+        self.frames_ready = time.monotonic() + 0.15
+
+    def close(self):
+        self.sock.close()
+
+    def wait_for_seat(self):
+        delay = self.input_ready - time.monotonic()
+        if delay > 0:
+            time.sleep(delay)
+
+    def key_event(self, code, down):
+        self.wait_for_seat()
+        self.sock.sendall(struct.pack(">BBHI", 4, down, 0, code))
+        if down and code not in self.held_keys:
+            self.held_keys.append(code)
+        elif not down and code in self.held_keys:
+            self.held_keys.remove(code)
+
+    def key(self, code):
+        self.key_event(code, 1)
+        self.key_event(code, 0)
+
+    def pointer(self, x, y, mask):
+        if not 0 <= x < self.width or not 0 <= y < self.height:
+            raise RuntimeError(f"point outside {self.width}x{self.height} display")
+        self.wait_for_seat()
+        self.sock.sendall(struct.pack(">BBHH", 5, mask, x, y))
+        self.position = (x, y)
+
+    def release_all(self):
+        for code in reversed(list(self.held_keys)):
+            self.key_event(code, 0)
+        if self.buttons and self.position:
+            self.buttons = 0
+            self.pointer(*self.position, 0)
+
+    def capture(self):
+        delay = self.frames_ready - time.monotonic()
+        if delay > 0:
+            time.sleep(delay)
+        self.sock.sendall(struct.pack(">BBHHHH", 3, 0, 0, 0, self.width, self.height))
+        while True:
+            kind = read_exact(self.sock, 1)[0]
+            if kind == 2:
+                continue
+            if kind == 3:
+                read_exact(self.sock, struct.unpack(">xxxI", read_exact(self.sock, 7))[0])
+                continue
+            if kind != 0:
+                raise RuntimeError(f"unsupported VNC message {kind}")
+            count = struct.unpack(">xH", read_exact(self.sock, 3))[0]
+            for _ in range(count):
+                x, y, w, h, encoding = struct.unpack(">HHHHi", read_exact(self.sock, 12))
+                if encoding != 0 or x + w > self.width or y + h > self.height:
+                    raise RuntimeError("unsupported VNC rectangle")
+                raw = read_exact(self.sock, w * h * 4)
+                for row in range(h):
+                    begin = ((y + row) * self.width + x) * 4
+                    self.frame[begin:begin + w * 4] = raw[row * w * 4:(row + 1) * w * 4]
+            if count:
+                return self.frame
+
+    def png(self, region=None, scale=1):
+        """Encode the last captured frame, optionally cropped to (x, y, width, height) and enlarged."""
+        rgb = bytearray(self.width * self.height * 3)
+        for channel in range(3):
+            rgb[channel::3] = self.frame[channel::4]
+        if region is None:
+            return encode_png(self.width, self.height, rgb, scale)
+        x, y, w, h = region
+        if w < 1 or h < 1 or x < 0 or y < 0 or x + w > self.width or y + h > self.height:
+            raise RuntimeError(f"region must lie within the {self.width}x{self.height} display")
+        stride = self.width * 3
+        crop = b"".join(rgb[(y + row) * stride + x * 3:(y + row) * stride + (x + w) * 3] for row in range(h))
+        return encode_png(w, h, crop, scale)
+
+    def wait_stable(self, timeout_ms, interval=0.2):
+        """Capture until two consecutive frames match; returns whether the screen settled in time."""
+        deadline = time.monotonic() + timeout_ms / 1000
+        previous = bytes(self.capture())
+        while time.monotonic() < deadline:
+            time.sleep(interval)
+            current = bytes(self.capture())
+            if current == previous:
+                return True
+            previous = current
+        return False
+
+
+def integer(action, name, low, high, default=None):
+    value = action.get(name, default)
+    if type(value) is not int or not low <= value <= high:
+        raise RuntimeError(f"{action.get('type', 'action')}: {name} must be an integer from {low} to {high}")
+    return value
+
+
+def point(item, width, height, required=True):
+    if not isinstance(item, dict):
+        raise RuntimeError("each point must be an object with x and y")
+    if not required and "x" not in item and "y" not in item:
+        return None
+    return integer(item, "x", 0, width - 1), integer(item, "y", 0, height - 1)
+
+
+def button(action):
+    mask = BUTTONS.get(action.get("button", "left"))
+    if mask is None:
+        raise RuntimeError(f"button must be one of {', '.join(BUTTONS)}")
+    return mask
+
+
+def modifier_codes(action):
+    names = action.get("modifiers", [])
+    if not isinstance(names, list) or any(not isinstance(name, str) or name.lower() not in MODIFIERS for name in names):
+        raise RuntimeError(f"modifiers must be a list drawn from {', '.join(sorted(MODIFIERS))}")
+    return [MODIFIERS[name.lower()] for name in dict.fromkeys(names)]
+
+
+def typeable(char):
+    return char in "\n\t" or 0x20 <= ord(char) <= 0x7E
+
+
+def normalize(action, width, height):
+    """Validate one action and convert it to an internal form, so a bad batch sends no input at all."""
+    if not isinstance(action, dict):
+        raise RuntimeError("each action must be an object")
+    kind = action.get("type")
+    if kind == "wait":
+        return {"type": kind, "seconds": integer(action, "milliseconds", 0, 10000) / 1000}
+    if kind == "move":
+        return {"type": kind, "at": point(action, width, height)}
+    if kind in ("click", "double_click", "triple_click"):
+        count = {"click": integer(action, "count", 1, 3, 1), "double_click": 2, "triple_click": 3}[kind]
+        return {"type": "click", "at": point(action, width, height, required=False), "button": button(action),
+                "count": count, "modifiers": modifier_codes(action)}
+    if kind in ("mouse_down", "mouse_up"):
+        return {"type": kind, "at": point(action, width, height, required=False), "button": button(action)}
+    if kind == "scroll":
+        vertical = integer(action, "steps", -100, 100, 0)
+        horizontal = integer(action, "horizontal_steps", -100, 100, 0)
+        if not vertical and not horizontal:
+            raise RuntimeError("scroll needs nonzero steps or horizontal_steps")
+        return {"type": kind, "at": point(action, width, height), "vertical": vertical, "horizontal": horizontal,
+                "modifiers": modifier_codes(action)}
+    if kind == "drag":
+        path = action.get("path")
+        if not isinstance(path, list) or not 2 <= len(path) <= 200:
+            raise RuntimeError("drag path needs 2 to 200 points")
+        return {"type": kind, "path": [point(item, width, height) for item in path], "button": button(action),
+                "seconds": integer(action, "duration_ms", 0, 10000, 300) / 1000, "modifiers": modifier_codes(action)}
+    if kind == "key":
+        code, modifiers = parse_key(action.get("key"), action.get("modifiers", []))
+        return {"type": kind, "code": code, "modifiers": modifiers}
+    if kind in ("key_down", "key_up"):
+        code, modifiers = parse_key(action.get("key"))
+        if modifiers:
+            raise RuntimeError(f"{kind} takes a single key; send one {kind} per key")
+        return {"type": kind, "code": code}
+    if kind == "type":
+        text = action.get("text")
+        if not isinstance(text, str) or not text:
+            raise RuntimeError("type needs nonempty text")
+        text = text.replace("\r\n", "\n").replace("\r", "\n")
+        if not all(typeable(char) for char in text) and not shutil.which("wl-copy"):
+            raise RuntimeError("text outside the US keymap is pasted, which needs wl-clipboard")
+        return {"type": kind, "text": text}
+    raise RuntimeError(f"unknown action type: {kind!r}")
+
+
+def normalize_batch(actions, width, height):
+    if not isinstance(actions, list) or not 1 <= len(actions) <= MAX_BATCH:
+        raise RuntimeError(f"actions needs 1 to {MAX_BATCH} items")
+    batch = [normalize(action, width, height) for action in actions]
+    if sum(action.get("seconds", 0) for action in batch) > MAX_BATCH_SECONDS:
+        raise RuntimeError(f"batch wait and drag time must not exceed {MAX_BATCH_SECONDS} seconds")
+    return batch
+
+
+def is_terminal(window):
+    app = (window or {}).get("app", "").lower()
+    return "term" in app or app.split(".")[-1] in TERMINALS
+
+
+def paste(rfb, text, shortcut=None):
+    """Paste through the private clipboard; terminals get Ctrl+Shift+V unless a shortcut is given."""
+    clipboard("private", "write", text)
+    if shortcut is None:
+        shortcut = "ctrl+shift+v" if is_terminal(focused_window()) else "ctrl+v"
+    code, modifiers = parse_key(shortcut)
+    for modifier in modifiers:
+        rfb.key_event(modifier, 1)
+    rfb.key(code)
+    for modifier in reversed(modifiers):
+        rfb.key_event(modifier, 0)
+    time.sleep(0.25)  # Apps fetch pasted data asynchronously; later keys must not overtake it.
+
+
+def type_text(rfb, text):
+    """Type US-keymap text key by key, pasting any line that holds other characters.
+
+    A second virtual keyboard (wtype) was tried for Unicode, but X11 apps read its keys with a stale keymap.
+    """
+    for index, line in enumerate(text.split("\n")):
+        if index:
+            rfb.key(KEYS["enter"])
+            time.sleep(0.01)
+        if not all(typeable(char) for char in line):
+            paste(rfb, line)
+            continue
+        for char in line:
+            code, modifiers = physical(KEYS["tab"] if char == "\t" else keysym(char), [])
+            for modifier in modifiers:
+                rfb.key_event(modifier, 1)
+            rfb.key(code)
+            for modifier in modifiers:
+                rfb.key_event(modifier, 0)
+            time.sleep(0.01)
+
+
+def execute(rfb, action):
+    kind = action["type"]
+    if kind == "wait":
+        time.sleep(action["seconds"])
+        return
+    at = action.get("at") or (action.get("path") or [None])[0] or rfb.position
+    if kind in ("click", "mouse_down", "mouse_up") and at is None:
+        raise RuntimeError(f"{kind} needs x and y because the pointer has not been placed yet")
+    for code in action.get("modifiers", []) if kind != "key" else []:
+        rfb.key_event(code, 1)
+    if kind == "move":
+        rfb.pointer(*at, rfb.buttons)
+    elif kind == "click":
+        rfb.pointer(*at, rfb.buttons)
+        for index in range(action["count"]):
+            if index:
+                time.sleep(0.06)
+            rfb.pointer(*at, rfb.buttons | action["button"])
+            rfb.pointer(*at, rfb.buttons)
+    elif kind == "mouse_down":
+        rfb.buttons |= action["button"]
+        rfb.pointer(*at, rfb.buttons)
+    elif kind == "mouse_up":
+        rfb.buttons &= ~action["button"]
+        rfb.pointer(*at, rfb.buttons)
+    elif kind == "scroll":
+        rfb.pointer(*at, rfb.buttons)
+        for steps, negative, positive in ((action["vertical"], "up", "down"), (action["horizontal"], "left", "right")):
+            for _ in range(abs(steps)):
+                rfb.pointer(*at, rfb.buttons | SCROLL[positive if steps > 0 else negative])
+                rfb.pointer(*at, rfb.buttons)
+                time.sleep(0.01)
+    elif kind == "drag":
+        path = action["path"]
+        rfb.pointer(*path[0], rfb.buttons)
+        rfb.buttons |= action["button"]
+        rfb.pointer(*path[0], rfb.buttons)
+        for before, after in zip(path, path[1:]):
+            steps = max(1, min(20, max(abs(after[0] - before[0]), abs(after[1] - before[1])) // 15))
+            for step in range(1, steps + 1):
+                rfb.pointer(round(before[0] + (after[0] - before[0]) * step / steps),
+                            round(before[1] + (after[1] - before[1]) * step / steps), rfb.buttons)
+                time.sleep(action["seconds"] / (len(path) - 1) / steps)
+        rfb.buttons &= ~action["button"]
+        rfb.pointer(*path[-1], rfb.buttons)
+    elif kind == "key":
+        for code in action["modifiers"]:
+            rfb.key_event(code, 1)
+        rfb.key(action["code"])
+        for code in reversed(action["modifiers"]):
+            rfb.key_event(code, 0)
+        if set(action["modifiers"]) - {MODIFIERS["shift"]}:
+            time.sleep(0.1)  # Apps such as LibreOffice run shortcuts asynchronously; later keys would overtake them.
+    elif kind == "key_down":
+        rfb.key_event(action["code"], 1)
+    elif kind == "key_up":
+        rfb.key_event(action["code"], 0)
+    elif kind == "type":
+        type_text(rfb, action["text"])
+    for code in reversed(action.get("modifiers", []) if kind != "key" else []):
+        rfb.key_event(code, 0)
+
+
+def run_actions(rfb, actions):
+    """Validate the whole batch, run it, and always release keys and buttons still held at the end."""
+    batch = normalize_batch(actions, rfb.width, rfb.height)
+    try:
+        for action in batch:
+            execute(rfb, action)
+    finally:
+        rfb.release_all()
+
+
+def host_display():
+    specified = os.environ.get("AGENT_DESKTOP_HOST_DISPLAY")
+    if specified:
+        return specified
+    hyprctl = shutil.which("hyprctl")
+    if not hyprctl:
+        raise RuntimeError("host display not found; set AGENT_DESKTOP_HOST_DISPLAY")
+    result = subprocess.run([hyprctl, "instances", "-j"], capture_output=True, text=True, timeout=5, check=True)
+    displays = [item.get("wl_socket") for item in json.loads(result.stdout) if item.get("wl_socket")]
+    if len(displays) != 1:
+        raise RuntimeError("expected one Hyprland display; set AGENT_DESKTOP_HOST_DISPLAY")
+    return displays[0]
+
+
+def clipboard(target, operation, content=None):
+    if operation not in ("read", "write"):
+        raise RuntimeError("clipboard operation must be read or write")
+    if target == "private":
+        env = desktop_env(state())
+    elif target == "host":
+        if operation == "read" and os.environ.get("AGENT_DESKTOP_ALLOW_HOST_CLIPBOARD") != "1":
+            raise RuntimeError("reading the host clipboard is disabled because it may hold passwords; "
+                               "set AGENT_DESKTOP_ALLOW_HOST_CLIPBOARD=1 to allow it")
+        env = os.environ.copy()
+        env.setdefault("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+        env["WAYLAND_DISPLAY"] = host_display()
+        env.pop("DISPLAY", None)
+    else:
+        raise RuntimeError("clipboard target must be private or host")
+    if operation == "read":
+        result = subprocess.run(["wl-paste", "--no-newline", "--type", "text/plain"], capture_output=True,
+                                text=True, env=env, timeout=10)
+        if result.returncode and "Nothing is copied" in result.stderr:
+            return ""
+    else:
+        # wl-copy stays in the background to serve the clipboard, so it must not inherit a pipe we wait on.
+        result = subprocess.run(["wl-copy", "--type", "text/plain"], input=content, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL, text=True, env=env, timeout=10)
+    if result.returncode:
+        raise RuntimeError(result.stderr.strip() or "clipboard command failed")
+    return result.stdout if operation == "read" else ""
+
+
+def status():
+    data = state(required=False)
+    if not data:
+        return {"running": False}
+    return {"running": True, "display": data["display"], "x_display": data.get("x_display"),
+            "resolution": data.get("resolution"), "session_pid": data["session_pid"],
+            "wayvnc_pid": data["wayvnc_pid"], "windows": windows()}
+
+
+def region_arg(value):
+    try:
+        x, y, w, h = (int(part) for part in value.split(","))
+    except ValueError:
+        raise argparse.ArgumentTypeError("region must be x,y,width,height") from None
+    return x, y, w, h
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest="action", required=True)
+    for name in ("start", "stop", "restart", "toggle", "status", "_record"):
+        sub.add_parser(name)
+    run = sub.add_parser("run", help="launch an app and wait for its window")
+    run.add_argument("--wait-ms", type=int, default=5000)
+    run.add_argument("--cwd", help="working directory for the app (default: home)")
+    run.add_argument("command", nargs=argparse.REMAINDER)
+    win = sub.add_parser("windows", help="list, focus, close, fullscreen, or float windows")
+    win.add_argument("operation", nargs="?", default="list", choices=("list", "focus", "close", "fullscreen", "float"))
+    win.add_argument("id", nargs="?", type=int)
+    shot = sub.add_parser("screenshot")
+    shot.add_argument("path")
+    shot.add_argument("--region", type=region_arg, help="x,y,width,height")
+    shot.add_argument("--scale", type=int, choices=(1, 2, 3, 4), default=1)
+    for name in ("click", "double-click", "triple-click", "move"):
+        pointer = sub.add_parser(name)
+        pointer.add_argument("x", type=int)
+        pointer.add_argument("y", type=int)
+        if name != "move":
+            pointer.add_argument("--button", choices=tuple(BUTTONS), default="left")
+            pointer.add_argument("--modifier", action="append", default=[])
+    key = sub.add_parser("key", help="press a key or combo such as ctrl+shift+t")
+    key.add_argument("name")
+    key.add_argument("--modifier", action="append", default=[])
+    typing = sub.add_parser("type")
+    typing.add_argument("text", nargs="?", help="read stdin if omitted")
+    scroll = sub.add_parser("scroll")
+    scroll.add_argument("x", type=int)
+    scroll.add_argument("y", type=int)
+    scroll.add_argument("steps", type=int, help="positive scrolls down; negative scrolls up")
+    scroll.add_argument("--horizontal", type=int, default=0, help="positive scrolls right; negative scrolls left")
+    drag = sub.add_parser("drag")
+    for name in ("x1", "y1", "x2", "y2"):
+        drag.add_argument(name, type=int)
+    wait = sub.add_parser("wait", help="wait for the screen to stop changing")
+    wait.add_argument("--timeout-ms", type=int, default=3000)
+    actions = sub.add_parser("actions")
+    actions.add_argument("json", nargs="?", help="JSON action list; read stdin if omitted")
+    clip = sub.add_parser("clipboard")
+    clip.add_argument("target", choices=("private", "host"))
+    clip.add_argument("operation", choices=("read", "write"))
+    args = parser.parse_args()
+    if args.action == "_record":
+        record()
+    elif args.action == "start":
+        print(start())
+    elif args.action == "stop":
+        print(stop())
+    elif args.action == "restart":
+        print(stop())
+        print(start())
+    elif args.action == "toggle":
+        print(stop() if state(required=False) else start())
+    elif args.action == "status":
+        print(json.dumps(status(), indent=2))
+    elif args.action == "run":
+        cmd = args.command[1:] if args.command and args.command[0] == "--" else args.command
+        if not cmd:
+            raise RuntimeError("give an application command after 'run --'")
+        result = launch(cmd, args.wait_ms, args.cwd)
+        print(json.dumps(result) if result["window"] else f"launched pid {result['pid']}; no new window yet")
+    elif args.action == "windows":
+        if args.operation == "list":
+            print(json.dumps(windows(), indent=2))
+        else:
+            window_action(args.operation, args.id)
+    elif args.action == "clipboard":
+        print(clipboard(args.target, args.operation, sys.stdin.read() if args.operation == "write" else None), end="")
+    else:
+        rfb = Rfb()
+        try:
+            if args.action == "screenshot":
+                rfb.capture()
+                Path(args.path).write_bytes(rfb.png(args.region, args.scale))
+                print(args.path)
+            elif args.action == "wait":
+                print("stable" if rfb.wait_stable(args.timeout_ms) else "still changing")
+            else:
+                if args.action == "actions":
+                    batch = json.loads(args.json if args.json is not None else sys.stdin.read())
+                elif args.action == "drag":
+                    batch = [{"type": "drag", "path": [{"x": args.x1, "y": args.y1}, {"x": args.x2, "y": args.y2}]}]
+                elif args.action == "key":
+                    batch = [{"type": "key", "key": args.name, "modifiers": args.modifier}]
+                elif args.action == "type":
+                    batch = [{"type": "type", "text": args.text if args.text is not None else sys.stdin.read()}]
+                elif args.action == "scroll":
+                    batch = [{"type": "scroll", "x": args.x, "y": args.y, "steps": args.steps,
+                              "horizontal_steps": args.horizontal}]
+                elif args.action == "move":
+                    batch = [{"type": "move", "x": args.x, "y": args.y}]
+                else:
+                    batch = [{"type": args.action.replace("-", "_"), "x": args.x, "y": args.y,
+                              "button": args.button, "modifiers": args.modifier}]
+                run_actions(rfb, batch)
+        finally:
+            rfb.close()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (RuntimeError, OSError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
+        print(f"agent-desktop: {exc}", file=sys.stderr)
+        raise SystemExit(1)

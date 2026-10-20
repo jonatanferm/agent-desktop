@@ -1,0 +1,417 @@
+#!/usr/bin/env python3
+"""Local MCP stdio bridge for the private agent desktop."""
+
+import base64
+import importlib.util
+import json
+import os
+import select
+import subprocess
+import sys
+import time
+from importlib.machinery import SourceFileLoader
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+_loader = SourceFileLoader("agent_desktop", str(HERE / "agent-desktop"))
+ad = importlib.util.module_from_spec(importlib.util.spec_from_loader(_loader.name, _loader))
+_loader.exec_module(ad)
+
+VERSION = json.loads((HERE.parent / "manifest.json").read_text())["version"]
+IDLE_SECONDS = 120
+WIDTH, HEIGHT = ad.resolution()
+SIZE = f"{WIDTH}x{HEIGHT}"
+
+
+def schema(properties, required=()):
+    return {"type": "object", "properties": properties, "required": list(required), "additionalProperties": False}
+
+
+def integer(description=None, minimum=None, maximum=None):
+    value = {"type": "integer"}
+    if description:
+        value["description"] = description
+    if minimum is not None:
+        value["minimum"] = minimum
+    if maximum is not None:
+        value["maximum"] = maximum
+    return value
+
+
+STRING = {"type": "string"}
+X = integer(f"Pixel column, 0 to {WIDTH - 1}", 0, WIDTH - 1)
+Y = integer(f"Pixel row, 0 to {HEIGHT - 1}", 0, HEIGHT - 1)
+BUTTON = {"type": "string", "enum": ["left", "middle", "right"]}
+MODIFIERS = {"type": "array", "items": {"type": "string", "enum": ["ctrl", "alt", "shift", "super", "altgr"]},
+             "description": "Keys held during the action"}
+POINT = schema({"x": X, "y": Y}, ("x", "y"))
+ACTION = {
+    "type": "object",
+    "description": "One action. Fields used depend on type; held keys and buttons are released when the batch ends.",
+    "properties": {
+        "type": {"type": "string", "enum": ["move", "click", "double_click", "triple_click", "mouse_down", "mouse_up",
+                                            "scroll", "drag", "key", "key_down", "key_up", "type", "wait"]},
+        "x": X, "y": Y, "button": BUTTON, "modifiers": MODIFIERS,
+        "count": integer("Clicks for click, 1 to 3", 1, 3),
+        "steps": integer("Scroll notches; positive is down", -100, 100),
+        "horizontal_steps": integer("Scroll notches; positive is right", -100, 100),
+        "path": {"type": "array", "items": POINT, "minItems": 2, "maxItems": 200},
+        "duration_ms": integer("Drag duration", 0, 10000),
+        "key": {"type": "string", "description": "Key name or combo, e.g. Return, F5, ctrl+shift+t"},
+        "text": STRING,
+        "milliseconds": integer("Wait length", 0, 10000),
+    },
+    "required": ["type"],
+    "additionalProperties": False,
+}
+TOOLS = [
+    {"name": "computer_screenshot",
+     "description": f"See the private agent desktop. Starts it if needed. Returns a {SIZE} PNG; all coordinates use its pixels.",
+     "inputSchema": schema({})},
+    {"name": "computer_zoom",
+     "description": "Return an enlarged crop of the screen to read small text or inspect detail. Coordinates stay in full-screen pixels.",
+     "inputSchema": schema({"x": X, "y": Y, "width": integer(minimum=1), "height": integer(minimum=1)},
+                           ("x", "y", "width", "height"))},
+    {"name": "computer_launch",
+     "description": "Launch a GUI app in the private desktop and wait for its window. Pass the executable and each argument as separate items, e.g. [\"chromium\", \"https://example.com\"]. Wayland and X11 apps work. New windows open as full-size tabs.",
+     "inputSchema": schema({"command": {"type": "array", "items": STRING, "minItems": 1},
+                            "wait_ms": integer("How long to wait for a window, default 5000", 0, 30000),
+                            "cwd": {"type": "string", "description": "Working directory, default the home directory"}},
+                           ("command",))},
+    {"name": "computer_windows",
+     "description": "List windows in the private desktop, or focus, close, fullscreen, or float one by id. Prefer this to clicking tabs.",
+     "inputSchema": schema({"operation": {"type": "string", "enum": ["list", "focus", "close", "fullscreen", "float"]},
+                            "id": integer("Window id from list")}, ("operation",))},
+    {"name": "computer_click",
+     "description": "Click at pixel coordinates, optionally holding modifiers (e.g. ctrl-click) or clicking 2-3 times to select words or lines. Returns a screenshot.",
+     "inputSchema": schema({"x": X, "y": Y, "button": BUTTON, "modifiers": MODIFIERS,
+                            "count": integer("1 to 3 clicks", 1, 3)}, ("x", "y"))},
+    {"name": "computer_double_click", "description": "Double-click at pixel coordinates. Returns a screenshot.",
+     "inputSchema": schema({"x": X, "y": Y, "button": BUTTON, "modifiers": MODIFIERS}, ("x", "y"))},
+    {"name": "computer_move", "description": "Move the pointer without clicking, for hover menus and tooltips. Returns a screenshot.",
+     "inputSchema": schema({"x": X, "y": Y}, ("x", "y"))},
+    {"name": "computer_key",
+     "description": "Press a key or combo in the focused app, e.g. Return, Tab, Escape, F5, ctrl+l, ctrl+shift+t. Returns a screenshot.",
+     "inputSchema": schema({"key": STRING, "modifiers": MODIFIERS}, ("key",))},
+    {"name": "computer_type",
+     "description": "Type text into the focused app. Any Unicode text works; newlines press Enter. Returns a screenshot.",
+     "inputSchema": schema({"text": STRING}, ("text",))},
+    {"name": "computer_paste",
+     "description": "Put text on the private clipboard and paste it; faster than typing for long text. The auto shortcut uses Ctrl+Shift+V in terminals and Ctrl+V elsewhere.",
+     "inputSchema": schema({"text": STRING, "shortcut": {"type": "string", "enum": ["auto", "ctrl_v", "ctrl_shift_v", "shift_insert"]}}, ("text",))},
+    {"name": "computer_scroll",
+     "description": "Scroll at pixel coordinates. Positive steps scroll down, positive horizontal_steps scroll right; hold ctrl to zoom in many apps. Returns a screenshot.",
+     "inputSchema": schema({"x": X, "y": Y, "steps": integer(minimum=-100, maximum=100),
+                            "horizontal_steps": integer(minimum=-100, maximum=100), "modifiers": MODIFIERS}, ("x", "y"))},
+    {"name": "computer_drag",
+     "description": "Drag along a path of points, optionally with another button or held modifiers. Legacy x1,y1,x2,y2 also works. Returns a screenshot.",
+     "inputSchema": schema({"path": {"type": "array", "items": POINT, "minItems": 2, "maxItems": 200},
+                            "x1": X, "y1": Y, "x2": X, "y2": Y, "button": BUTTON, "modifiers": MODIFIERS,
+                            "duration_ms": integer(minimum=0, maximum=10000)})},
+    {"name": "computer_wait",
+     "description": "Wait for the screen to update, then return a screenshot. With until_stable (default true) it returns as soon as the screen stops changing, up to milliseconds (default 3000).",
+     "inputSchema": schema({"milliseconds": integer(minimum=0, maximum=10000), "until_stable": {"type": "boolean"}})},
+    {"name": "computer_actions",
+     "description": f"Run 1 to {ad.MAX_BATCH} ordered actions in one step, then return one screenshot. The whole batch is validated before any input is sent. Use for sequences such as ctrl+l, type a URL, Return, wait.",
+     "inputSchema": schema({"actions": {"type": "array", "items": ACTION, "minItems": 1, "maxItems": ad.MAX_BATCH},
+                            "settle_ms": integer("Pause before the screenshot, default 150", 0, 10000)}, ("actions",))},
+    {"name": "computer_clipboard",
+     "description": "Read or write text on the private clipboard or the user's host clipboard, or transfer between them (target is the destination). Reading the host clipboard is off unless the user enabled it.",
+     "inputSchema": schema({"operation": {"type": "string", "enum": ["read", "write", "transfer"]},
+                            "target": {"type": "string", "enum": ["private", "host"]},
+                            "source": {"type": "string", "enum": ["private", "host"]}, "text": STRING}, ("operation", "target"))},
+    {"name": "computer_desktop",
+     "description": "Show the private desktop's status and windows, or restart it if it is stuck. Restart closes every app in it.",
+     "inputSchema": schema({"operation": {"type": "string", "enum": ["status", "restart"]}}, ("operation",))},
+]
+TOOL_NAMES = {tool["name"] for tool in TOOLS}
+INSTRUCTIONS = (f"These computer_* tools drive a separate private {SIZE} desktop, so the user's own screen, mouse and "
+                "keyboard are never touched. Start apps with computer_launch, switch with computer_windows, and use "
+                "computer_actions for ordered sequences. Every input tool returns a fresh screenshot. The user's own "
+                "windows are not reachable; clipboard transfer to the host is explicit.")
+
+
+class Desktop:
+    """Keeps one VNC connection open across tool calls and reconnects if the desktop restarts."""
+
+    def __init__(self):
+        self.rfb = None
+        self.used = 0
+
+    def connection(self):
+        data = ad.state(required=False)
+        if not data:
+            self.drop()
+            ad.start()
+            data = ad.state()
+        if self.rfb and self.rfb.token != data.get("token"):
+            self.drop()
+        if not self.rfb:
+            self.rfb = ad.Rfb()
+        self.used = time.monotonic()
+        return self.rfb
+
+    def drop(self):
+        if self.rfb:
+            try:
+                self.rfb.close()
+            except OSError:
+                pass
+            self.rfb = None
+
+    def idle(self):
+        return self.rfb is not None and time.monotonic() - self.used > IDLE_SECONDS
+
+
+desktop = Desktop()
+
+
+def text(value):
+    return {"type": "text", "text": value}
+
+
+def image(png):
+    return {"type": "image", "data": base64.b64encode(png).decode("ascii"), "mimeType": "image/png"}
+
+
+def context_line():
+    try:
+        window = ad.focused_window()
+    except (RuntimeError, OSError, ValueError):
+        return None
+    if not window:
+        return "No window is focused."
+    return f"Focused window {window['id']}: {window['app']} - {window['title']}"
+
+
+def screen(note=None):
+    try:
+        desktop.connection().capture()
+    except (RuntimeError, OSError):
+        desktop.drop()  # A restarted desktop or broken socket; one clean retry.
+        desktop.connection().capture()
+    lines = [line for line in (note, context_line()) if line]
+    return [text("\n".join(lines))] * bool(lines) + [image(desktop.rfb.png())]
+
+
+def act(actions, settle_ms=150):
+    rfb = desktop.connection()
+    try:
+        ad.normalize_batch(actions, rfb.width, rfb.height)
+    except RuntimeError as exc:
+        raise ValueError(str(exc)) from None  # Nothing was sent, so no screenshot is needed.
+    try:
+        ad.run_actions(rfb, actions)
+    except (RuntimeError, OSError) as exc:
+        if isinstance(exc, OSError):
+            desktop.drop()
+            raise
+        return {"content": [text(str(exc)), *screen()], "isError": True}
+    time.sleep(settle_ms / 1000)
+    return {"content": screen()}
+
+
+def arg(args, name, kind, default=None, required=False):
+    if name not in args:
+        if required:
+            raise ValueError(f"missing argument: {name}")
+        return default
+    value = args[name]
+    if kind is int and type(value) is not int or kind is not int and not isinstance(value, kind):
+        raise ValueError(f"{name} must be {kind.__name__}")
+    return value
+
+
+def pointer_action(kind, args, **extra):
+    action = {"type": kind, "x": arg(args, "x", int, required=True), "y": arg(args, "y", int, required=True)}
+    for name in ("button", "modifiers", "count", "steps", "horizontal_steps"):
+        if name in args:
+            action[name] = args[name]
+    return {**action, **extra}
+
+
+def call(name, args):
+    if name not in TOOL_NAMES:
+        raise ValueError(f"unknown tool: {name}")
+    if not isinstance(args, dict):
+        raise ValueError("arguments must be an object")
+    if name == "computer_desktop":
+        operation = arg(args, "operation", str, required=True)
+        if operation == "restart":
+            desktop.drop()
+            ad.stop()
+            ad.start()
+            return {"content": screen("Desktop restarted.")}
+        if operation != "status":
+            raise ValueError("operation must be status or restart")
+        desktop.connection()
+        return {"content": [text(json.dumps(ad.status(), indent=2))]}
+    if name == "computer_clipboard":
+        return clipboard(args)
+    desktop.connection()
+    if name == "computer_screenshot":
+        return {"content": screen()}
+    if name == "computer_zoom":
+        region = tuple(arg(args, key, int, required=True) for key in ("x", "y", "width", "height"))
+        scale = max(1, min(4, WIDTH // region[2], HEIGHT // region[3]))
+        rfb = desktop.connection()
+        rfb.capture()
+        return {"content": [text(f"Region {region[0]},{region[1]} {region[2]}x{region[3]} at {scale}x"),
+                            image(rfb.png(region, scale))]}
+    if name == "computer_launch":
+        result = ad.launch(arg(args, "command", list, required=True), arg(args, "wait_ms", int, 5000),
+                           arg(args, "cwd", str))
+        window = result["window"]
+        if not window:
+            return {"content": screen(f"Started pid {result['pid']}, but no new window appeared yet; "
+                                      f"try computer_wait. App output is in {ad.APP_LOG}.")}
+        note = f"Opened window {window['id']}: {window['app']} - {window['title']}"
+        others = [w for w in result["new_windows"] if w["id"] != window["id"]]
+        if others:
+            note += "\nAlso opened: " + "; ".join(f"{w['id']}: {w['app']} - {w['title']}" for w in others)
+        return {"content": screen(note)}
+    if name == "computer_windows":
+        operation = arg(args, "operation", str, required=True)
+        if operation == "list":
+            return {"content": [text(json.dumps(ad.windows(), indent=2))]}
+        ad.window_action(operation, arg(args, "id", int, required=True))
+        time.sleep(0.15)
+        return {"content": screen()}
+    if name == "computer_wait":
+        milliseconds = arg(args, "milliseconds", int, 3000)
+        if not 0 <= milliseconds <= 10000:
+            raise ValueError("milliseconds must be 0 to 10000")
+        if arg(args, "until_stable", bool, True):
+            stable = desktop.connection().wait_stable(milliseconds)
+            return {"content": screen(None if stable else f"Screen was still changing after {milliseconds} ms.")}
+        time.sleep(milliseconds / 1000)
+        return {"content": screen()}
+    if name == "computer_paste":
+        value = arg(args, "text", str, required=True)
+        strokes = {"auto": None, "ctrl_v": "ctrl+v", "ctrl_shift_v": "ctrl+shift+v", "shift_insert": "shift+Insert"}
+        choice = arg(args, "shortcut", str, "auto")
+        if choice not in strokes:
+            raise ValueError(f"shortcut must be one of {', '.join(strokes)}")
+        ad.paste(desktop.connection(), value, strokes[choice])
+        return {"content": screen()}
+    if name == "computer_click":
+        return act([pointer_action("click", args)])
+    if name == "computer_double_click":
+        return act([pointer_action("double_click", args)])
+    if name == "computer_move":
+        return act([pointer_action("move", args)])
+    if name == "computer_scroll":
+        return act([pointer_action("scroll", args)])
+    if name == "computer_key":
+        return act([{"type": "key", "key": arg(args, "key", str, required=True), "modifiers": arg(args, "modifiers", list, [])}])
+    if name == "computer_type":
+        return act([{"type": "type", "text": arg(args, "text", str, required=True)}])
+    if name == "computer_drag":
+        path = args.get("path")
+        if path is None:
+            path = [{"x": arg(args, "x1", int, required=True), "y": arg(args, "y1", int, required=True)},
+                    {"x": arg(args, "x2", int, required=True), "y": arg(args, "y2", int, required=True)}]
+        drag = {"type": "drag", "path": path}
+        for key in ("button", "modifiers", "duration_ms"):
+            if key in args:
+                drag[key] = args[key]
+        return act([drag])
+    if name == "computer_actions":
+        settle = arg(args, "settle_ms", int, 150)
+        if not 0 <= settle <= 10000:
+            raise ValueError("settle_ms must be 0 to 10000")
+        return act(arg(args, "actions", list, required=True), settle)
+    raise ValueError(f"unhandled tool: {name}")
+
+
+def clipboard(args):
+    operation = arg(args, "operation", str, required=True)
+    target = arg(args, "target", str, required=True)
+    if target not in ("private", "host"):
+        raise ValueError("target must be private or host")
+    if "private" in (target, args.get("source")):
+        desktop.connection()
+    if operation == "read":
+        return {"content": [text(ad.clipboard(target, "read"))]}
+    if operation == "transfer":
+        source = arg(args, "source", str, required=True)
+        if source not in ("private", "host") or source == target:
+            raise ValueError("source and target must be different desktops")
+        value = ad.clipboard(source, "read")
+    elif operation == "write":
+        value = arg(args, "text", str, required=True)
+    else:
+        raise ValueError("operation must be read, write, or transfer")
+    ad.clipboard(target, "write", value)
+    return {"content": [text(f"Wrote {len(value)} characters to the {target} clipboard")]}
+
+
+def respond(request_id, result=None, error=None):
+    response = {"jsonrpc": "2.0", "id": request_id}
+    response["error" if error else "result"] = error or result
+    sys.stdout.write(json.dumps(response, separators=(",", ":")) + "\n")
+    sys.stdout.flush()
+
+
+def handle(request):
+    method = request.get("method")
+    if "id" not in request:
+        return  # Notifications need no reply.
+    if method == "initialize":
+        requested = (request.get("params") or {}).get("protocolVersion")
+        version = requested if requested in ("2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25") else "2025-06-18"
+        respond(request["id"], {"protocolVersion": version, "capabilities": {"tools": {}},
+                                "serverInfo": {"name": "agent-desktop", "version": VERSION},
+                                "instructions": INSTRUCTIONS})
+    elif method == "tools/list":
+        respond(request["id"], {"tools": TOOLS})
+    elif method == "tools/call":
+        params = request.get("params") or {}
+        try:
+            result = call(params.get("name"), params.get("arguments") or {})
+        except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as exc:
+            if isinstance(exc, OSError):
+                desktop.drop()
+            result = {"content": [text(str(exc))], "isError": True}
+        respond(request["id"], result)
+    elif method == "ping":
+        respond(request["id"], {})
+    else:
+        respond(request["id"], error={"code": -32601, "message": f"Method not found: {method}"})
+
+
+def lines():
+    """Yield stdin lines, closing the VNC connection after a quiet period so WayVNC is not held open idle."""
+    pending = b""
+    while True:
+        while b"\n" not in pending:
+            if desktop.rfb and not select.select([0], [], [], IDLE_SECONDS)[0]:
+                if desktop.idle():
+                    desktop.drop()
+                continue
+            chunk = os.read(0, 1 << 16)
+            if not chunk:
+                if pending.strip():
+                    yield pending
+                return
+            pending += chunk
+        line, pending = pending.split(b"\n", 1)
+        if line.strip():
+            yield line
+
+
+def serve():
+    for line in lines():
+        try:
+            request = json.loads(line)
+            if not isinstance(request, dict):
+                raise ValueError("request must be an object")
+        except ValueError as exc:
+            respond(None, error={"code": -32700, "message": f"Parse error: {exc}"})
+            continue
+        handle(request)
+    desktop.drop()
+
+
+if __name__ == "__main__":
+    serve()
