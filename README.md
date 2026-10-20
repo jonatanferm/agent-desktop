@@ -19,11 +19,21 @@ Computer-use agents normally drive your real desktop: they steal focus, move you
 
 ## Quick start
 
-Install the two dependencies:
+Install the dependencies:
 
 ```sh
 omarchy pkg add sway wayvnc wl-clipboard   # or: sudo pacman -S sway wayvnc wl-clipboard
 ```
+
+| Package | Needed for |
+| --- | --- |
+| `sway`, `wayvnc` | The desktop itself and its screen and input bridge |
+| `wl-clipboard` | Clipboard tools, and typing text outside the US keymap |
+| `python` 3, `dbus` | The CLI and MCP server (standard library only) and the private session bus; already on Omarchy |
+| `xorg-xwayland` | X11 apps; already on Omarchy, since Hyprland depends on it |
+| `socat`, `tigervnc` | Optional, for watching the desktop yourself |
+
+The host-clipboard bridge uses Hyprland's `hyprctl`.
 
 Clone the repository and register the MCP server with your agent:
 
